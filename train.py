@@ -123,7 +123,7 @@ def save_checkpoint(model, optimizer, epoch, val_acc, filename):
     }
     torch.save(state, filename)
 
-def plot_training_history(train_losses, val_losses, train_accs, val_accs):
+def plot_training_history(train_losses, val_losses, train_accs, val_accs, filename='training_history.png'):
     """Plot training and validation history"""
     plt.figure(figsize=(12, 5))
     
@@ -144,40 +144,52 @@ def plot_training_history(train_losses, val_losses, train_accs, val_accs):
     plt.title('Accuracy Curves')
     
     plt.tight_layout()
-    plt.savefig('training_history.png')
+    plt.savefig(filename)
     plt.close()
 
-def train(model_name, batch_size=32, lr=0.001, epochs=30, patience=5, device_override=None, use_wandb=True):
-    """Main training function with early stopping"""
-    # Generate timestamp for run name
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M")
-    run_name = f"{model_name}_{timestamp}"
+def train_one_fold(model_name, fold_idx, n_folds, batch_size, lr, epochs, patience, device, use_wandb=True, run_id=None, fastmode=False):
+    """Train a model on one fold"""
+    # Generate fold-specific name
+    fold_name = f"fold_{fold_idx+1}_of_{n_folds}"
     
-    # Initialize wandb if enabled
+    # Join the main run with a fold-specific group if using wandb
     if use_wandb:
-        wandb.init(
-            project="coffee-classification",
-            name=run_name,
-            config={
-                "model": model_name,
-                "batch_size": batch_size,
-                "learning_rate": lr,
-                "epochs": epochs,
-                "patience": patience
-            }
-        )
+        if run_id is None:
+            # This is the first fold, create a new wandb run
+            wandb_run = wandb.init(
+                project="coffee-classification",
+                name=f"{model_name}_{datetime.now().strftime('%Y%m%d-%H%M')}",
+                group=f"{model_name}_5fold_{datetime.now().strftime('%Y%m%d-%H%M')}",
+                config={
+                    "model": model_name,
+                    "batch_size": batch_size,
+                    "learning_rate": lr,
+                    "epochs": epochs,
+                    "patience": patience,
+                    "n_folds": n_folds
+                }
+            )
+            run_id = wandb.run.id
+        else:
+            # Continue the existing run with a new name
+            wandb_run = wandb.init(
+                project="coffee-classification",
+                name=f"{model_name}_{fold_name}",
+                group=f"{model_name}_5fold_{datetime.now().strftime('%Y%m%d-%H%M')}",
+                id=run_id,
+                resume="allow"
+            )
     
-    # Set device using the utility function
-    device = check_set_gpu(device_override)
+    print(f"\n{'='*20}\nTraining fold {fold_idx+1} of {n_folds}\n{'='*20}")
     
     # Create output directory
     os.makedirs('models', exist_ok=True)
     
-    # Get data loaders
-    train_loader, val_loader, classes = get_data_loaders(batch_size=batch_size)
+    # Get data loaders for this specific fold
+    train_loader, val_loader, classes = get_data_loaders(
+        batch_size=batch_size, fold_idx=fold_idx, n_folds=n_folds, fastmode=fastmode
+    )
     num_classes = len(classes)
-    print(f"Classes: {classes}")
-    print(f"Number of classes: {num_classes}")
     
     # Get model
     model = get_model(model_name, num_classes)
@@ -190,7 +202,7 @@ def train(model_name, batch_size=32, lr=0.001, epochs=30, patience=5, device_ove
     # Loss function and optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
     
     # Initialize variables
     best_val_acc = 0.0
@@ -201,21 +213,35 @@ def train(model_name, batch_size=32, lr=0.001, epochs=30, patience=5, device_ove
     train_losses, val_losses = [], []
     train_accs, val_accs = [], []
     
+    # Track the previous learning rate for manual verbose output
+    prev_lr = optimizer.param_groups[0]['lr']
+    
+    # In fast mode, reduce the number of epochs
+    if fastmode:
+        print(f"Fast mode enabled: Running only {min(3, epochs)} epochs")
+        epochs = min(3, epochs)
+    
     start_time = time.time()
     for epoch in range(epochs):
         if early_stop:
             print("Early stopping triggered!")
             break
             
-        print(f"\nEpoch {epoch+1}/{epochs}")
+        print(f"\nFold {fold_idx+1}/{n_folds}, Epoch {epoch+1}/{epochs}")
         print("-" * 20)
         
-        # Train and validate - pass device to the functions
+        # Train and validate
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, epoch, device)
         val_loss, val_acc = validate(model, val_loader, criterion, device)
         
         # Update learning rate
         scheduler.step(val_loss)
+        
+        # Manually check if learning rate changed and log it
+        current_lr = optimizer.param_groups[0]['lr']
+        if current_lr != prev_lr:
+            print(f"Learning rate changed from {prev_lr:.6f} to {current_lr:.6f}")
+            prev_lr = current_lr
         
         # Save history
         train_losses.append(train_loss)
@@ -226,11 +252,12 @@ def train(model_name, batch_size=32, lr=0.001, epochs=30, patience=5, device_ove
         # Log metrics to wandb if enabled
         if use_wandb:
             wandb.log({
-                "train_loss": train_loss,
-                "train_acc": train_acc,
-                "val_loss": val_loss,
-                "val_acc": val_acc,
-                "learning_rate": optimizer.param_groups[0]['lr'],
+                "fold": fold_idx + 1,
+                f"fold_{fold_idx+1}/train_loss": train_loss,
+                f"fold_{fold_idx+1}/train_acc": train_acc,
+                f"fold_{fold_idx+1}/val_loss": val_loss,
+                f"fold_{fold_idx+1}/val_acc": val_acc,
+                f"fold_{fold_idx+1}/learning_rate": optimizer.param_groups[0]['lr'],
                 "epoch": epoch + 1
             })
         
@@ -242,12 +269,12 @@ def train(model_name, batch_size=32, lr=0.001, epochs=30, patience=5, device_ove
         if val_acc > best_val_acc:
             print(f"Validation accuracy improved from {best_val_acc:.2f}% to {val_acc:.2f}%")
             best_val_acc = val_acc
-            checkpoint_path = f"models/{run_name}_best.pth"
-            save_checkpoint(model, optimizer, epoch, val_acc, checkpoint_path)
+            model_filename = f"models/{model_name}_fold{fold_idx+1}of{n_folds}_best.pth"
+            save_checkpoint(model, optimizer, epoch, val_acc, model_filename)
             
             # Save best model to wandb if enabled
             if use_wandb:
-                wandb.save(checkpoint_path)
+                wandb.save(model_filename)
                 
             epochs_no_improve = 0
         else:
@@ -259,45 +286,120 @@ def train(model_name, batch_size=32, lr=0.001, epochs=30, patience=5, device_ove
             print(f"Early stopping triggered after {patience} epochs without improvement")
             early_stop = True
     
-    # Print final summary
-    training_time = time.time() - start_time
-    print(f"Training complete in {training_time:.2f}s")
-    print(f"Best validation accuracy: {best_val_acc:.2f}%")
-    
-    # Plot training history
-    plot_training_history(train_losses, val_losses, train_accs, val_accs)
+    # Plot training history for this fold
+    plot_filename = f"training_history_fold{fold_idx+1}.png"
+    plot_training_history(train_losses, val_losses, train_accs, val_accs, filename=plot_filename)
     if use_wandb:
-        wandb.log({"training_history": wandb.Image("training_history.png")})
+        wandb.log({f"fold_{fold_idx+1}/training_history": wandb.Image(plot_filename)})
     
-    # Save the final model
-    final_model_path = f"models/{run_name}_final.pth"
-    save_checkpoint(model, optimizer, epoch, val_acc, final_model_path)
-    if use_wandb:
-        wandb.save(final_model_path)
-    
-    # Finish wandb run if enabled
-    if use_wandb:
+    # Close wandb run for this fold
+    if use_wandb and fold_idx < n_folds - 1:  # Don't finish the last fold yet
         wandb.finish()
     
-    return model, best_val_acc
+    # Return best validation accuracy for this fold
+    return best_val_acc, run_id
+
+def train_kfold(model_name, batch_size=32, lr=0.001, epochs=30, patience=5, device_override=None, use_wandb=True, n_folds=5, fastmode=False):
+    """Train with k-fold cross-validation"""
+    # Set device using the utility function
+    device = check_set_gpu(device_override)
+    
+    # Initialize list to store results for each fold
+    fold_accuracies = []
+    run_id = None  # For wandb continuity between folds
+    
+    # In fast mode, reduce the number of folds if needed
+    if fastmode and n_folds > 2:
+        print(f"Fast mode enabled: Running only 2 folds instead of {n_folds}")
+        n_folds = 2
+    
+    # Train each fold
+    for fold_idx in range(n_folds):
+        best_val_acc, run_id = train_one_fold(
+            model_name, fold_idx, n_folds,
+            batch_size, lr, epochs, patience,
+            device, use_wandb, run_id, fastmode
+        )
+        fold_accuracies.append(best_val_acc)
+    
+    # Calculate and print cross-validation results
+    mean_accuracy = np.mean(fold_accuracies)
+    std_accuracy = np.std(fold_accuracies)
+    print(f"\n{'='*50}")
+    print(f"Cross-Validation Results for {model_name}")
+    print(f"{'='*50}")
+    for fold_idx, acc in enumerate(fold_accuracies):
+        print(f"Fold {fold_idx+1}: {acc:.2f}%")
+    print(f"{'='*50}")
+    print(f"Mean Accuracy: {mean_accuracy:.2f}% ± {std_accuracy:.2f}%")
+    print(f"{'='*50}")
+    
+    # Log final cross-validation results to wandb
+    if use_wandb:
+        wandb.log({
+            "cv_mean_accuracy": mean_accuracy,
+            "cv_std_accuracy": std_accuracy,
+            "cv_fold_accuracies": fold_accuracies
+        })
+        
+        # Create a summary plot of fold accuracies
+        plt.figure(figsize=(10, 6))
+        plt.bar(range(1, n_folds+1), fold_accuracies)
+        plt.axhline(y=mean_accuracy, color='r', linestyle='-', label=f'Mean: {mean_accuracy:.2f}%')
+        plt.axhline(y=mean_accuracy+std_accuracy, color='r', linestyle='--')
+        plt.axhline(y=mean_accuracy-std_accuracy, color='r', linestyle='--', label=f'Std: ±{std_accuracy:.2f}%')
+        plt.xlabel('Fold')
+        plt.ylabel('Validation Accuracy (%)')
+        plt.title(f'Cross-Validation Results - {model_name}')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig('cv_results.png')
+        wandb.log({"cv_results": wandb.Image('cv_results.png')})
+        
+        # Finish wandb run
+        wandb.finish()
+    
+    return mean_accuracy, std_accuracy, fold_accuracies
 
 def main():
     """Main function to parse arguments and start training"""
     parser = argparse.ArgumentParser(description="Train coffee classification models")
-    parser.add_argument("--model", type=str, choices=["efficientnet", "shufflenet", "resnet152", "vit"], 
-                        default="efficientnet", help="Model architecture to use")
+    parser.add_argument("--model", type=str, choices=["efficientnet", "shufflenet", "resnet152", "vit", "all"], 
+                        default="all", help="Model architecture to use, 'all' to run all models sequentially")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
-    parser.add_argument("--epochs", type=int, default=30, help="Number of epochs")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument("--patience", type=int, default=5, help="Early stopping patience")
     parser.add_argument("--device", type=str, choices=["cuda", "mps", "cpu"], 
                         default=None, help="Device to use (overrides automatic detection)")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--folds", type=int, default=5, help="Number of folds for cross-validation")
+    parser.add_argument("--fastmode", action="store_true", 
+                        help="Enable fast mode: uses less data, fewer epochs, and fewer folds for quick testing")
     
     args = parser.parse_args()
     
-    print(f"Training with {args.model} model")
-    train(args.model, args.batch_size, args.lr, args.epochs, args.patience, args.device, not args.no_wandb)
+    # Define all available models
+    all_models = ["efficientnet", "shufflenet", "resnet152", "vit"]
+    
+    # Determine which models to run
+    models_to_run = all_models if args.model == "all" else [args.model]
+    
+    # Run training for each selected model
+    for model_name in models_to_run:
+        print(f"\n\n{'='*60}")
+        print(f"Starting training for model: {model_name}")
+        print(f"{'='*60}\n")
+        
+        train_kfold(model_name, args.batch_size, args.lr, args.epochs, args.patience, 
+                    args.device, not args.no_wandb, args.folds, args.fastmode)
+        
+        print(f"\n{'='*60}")
+        print(f"Completed training for model: {model_name}")
+        print(f"{'='*60}\n")
+        
+        # Small delay between models to ensure wandb runs are separate
+        time.sleep(2)
 
 if __name__ == "__main__":
     main()

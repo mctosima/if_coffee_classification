@@ -1,25 +1,29 @@
-
 import os
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 import numpy as np
+from sklearn.model_selection import KFold
 
 class CoffeeDataset(Dataset):
-    def __init__(self, root_dir="dataset_kopi", transform=None, split="train", train_ratio=0.8, seed=42):
+    def __init__(self, root_dir="dataset_kopi", transform=None, split="train", fold_idx=0, n_folds=5, seed=42, fastmode=False):
         """
         Args:
             root_dir (string): Directory with all the images organized in class folders
             transform (callable, optional): Optional transform to be applied on a sample
             split (string): 'train' or 'val' to specify the dataset split
-            train_ratio (float): Ratio of data to use for training
+            fold_idx (int): Current fold index (0 to n_folds-1)
+            n_folds (int): Number of folds for cross-validation
             seed (int): Random seed for reproducibility
+            fastmode (bool): If True, use a small subset of data for quick testing
         """
         self.root_dir = root_dir
         self.transform = transform
         self.split = split
-        self.train_ratio = train_ratio
+        self.fold_idx = fold_idx
+        self.n_folds = n_folds
+        self.fastmode = fastmode
         
         # Get all class folders (labels)
         self.classes = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
@@ -36,24 +40,36 @@ class CoffeeDataset(Dataset):
             class_dir = os.path.join(root_dir, class_name)
             class_idx = self.class_to_idx[class_name]
             
-            for img_name in os.listdir(class_dir):
-                if img_name.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
-                    self.image_paths.append(os.path.join(class_dir, img_name))
-                    self.labels.append(class_idx)
+            image_files = [img_name for img_name in os.listdir(class_dir) 
+                          if img_name.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif'))]
+            
+            # In fast mode, use only a small subset of images per class
+            if fastmode:
+                # Use at most 5 images per class for quick testing
+                image_files = image_files[:5]
+                
+            for img_name in image_files:
+                self.image_paths.append(os.path.join(class_dir, img_name))
+                self.labels.append(class_idx)
         
         # Set random seed for reproducibility
         np.random.seed(seed)
         
-        # Split dataset into train and validation
+        # Use KFold from scikit-learn for consistent fold splitting
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+        
+        # Convert to numpy arrays for indexing
         indices = np.arange(len(self.image_paths))
-        np.random.shuffle(indices)
         
-        split_idx = int(len(indices) * self.train_ratio)
+        # Get the train and validation indices for the current fold
+        fold_splits = list(kf.split(indices))
+        train_indices, val_indices = fold_splits[fold_idx]
         
+        # Assign the appropriate indices based on the split
         if self.split == "train":
-            self.indices = indices[:split_idx]
+            self.indices = indices[train_indices]
         else:  # validation set
-            self.indices = indices[split_idx:]
+            self.indices = indices[val_indices]
     
     def __len__(self):
         return len(self.indices)
@@ -75,13 +91,16 @@ class CoffeeDataset(Dataset):
         return image, label
 
 
-def get_data_loaders(batch_size=32, num_workers=4):
+def get_data_loaders(batch_size=32, num_workers=4, fold_idx=0, n_folds=5, fastmode=False):
     """
-    Create data loaders for training and validation
+    Create data loaders for training and validation for a specific fold
     
     Args:
         batch_size (int): Batch size for training
         num_workers (int): Number of workers for data loading
+        fold_idx (int): Index of the current fold
+        n_folds (int): Total number of folds
+        fastmode (bool): If True, use a small subset of data for quick testing
         
     Returns:
         train_loader, val_loader: DataLoader objects for training and validation
@@ -102,9 +121,12 @@ def get_data_loaders(batch_size=32, num_workers=4):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    # Create datasets
-    train_dataset = CoffeeDataset(split="train", transform=train_transform)
-    val_dataset = CoffeeDataset(split="val", transform=val_transform)
+    # Create datasets for the specific fold
+    train_dataset = CoffeeDataset(split="train", transform=train_transform, fold_idx=fold_idx, n_folds=n_folds, fastmode=fastmode)
+    val_dataset = CoffeeDataset(split="val", transform=val_transform, fold_idx=fold_idx, n_folds=n_folds, fastmode=fastmode)
+    
+    if fastmode:
+        print(f"Fast mode enabled: Using {len(train_dataset)} training samples and {len(val_dataset)} validation samples")
     
     # Create data loaders
     train_loader = DataLoader(
@@ -128,7 +150,8 @@ def get_data_loaders(batch_size=32, num_workers=4):
 
 # Example usage
 if __name__ == "__main__":
-    train_loader, val_loader, classes = get_data_loaders()
+    # Test for fold 0 of 5
+    train_loader, val_loader, classes = get_data_loaders(fold_idx=0, n_folds=5)
     print(f"Classes: {classes}")
     print(f"Number of training batches: {len(train_loader)}")
     print(f"Number of validation batches: {len(val_loader)}")
@@ -137,3 +160,14 @@ if __name__ == "__main__":
     images, labels = next(iter(train_loader))
     print(f"Batch shape: {images.shape}")
     print(f"Labels shape: {labels.shape}")
+    
+    # Verify different folds have different splits
+    for fold in range(5):
+        train_loader, val_loader, _ = get_data_loaders(fold_idx=fold, n_folds=5)
+        print(f"Fold {fold}: Train batches={len(train_loader)}, Val batches={len(val_loader)}")
+
+    try:
+        loaders = get_data_loaders(fold_idx=0, n_folds=5)
+        print("Success: get_data_loaders accepts fold_idx and n_folds parameters")
+    except TypeError as e:
+        print(f"Error: {e}")
